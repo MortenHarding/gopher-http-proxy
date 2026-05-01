@@ -125,9 +125,14 @@ Lines here are displayed as Gopher type 'i' (info) items
 at the top of the root gophermap — ASCII art is perfect here.
 
 [urls]
+Group Title
+_______________________________
 Display Label      | https://host/path/
 Another Label      | ftp.gnu.org/gnu
-https://bare.url/  
+
+Another Group
+_______________________________
+https://bare.url/
 ```
 
 Two sections are supported:
@@ -141,6 +146,13 @@ One URL per line, in the format `Label | URL`. If no `|` separator is present,
 the raw URL is used as both the label and the target. The `https://` scheme is
 added automatically if omitted.
 
+URLs can optionally be organised into named **groups**. A group starts with a
+title line followed immediately by the fixed separator string
+`_______________________________`. All URL lines that follow belong to that
+group, until the next group title or the end of the file. Separate groups with
+a blank line for readability. URLs listed before any group title are collected
+into an anonymous group and rendered without a heading.
+
 ### Example config
 
 ```ini
@@ -148,14 +160,20 @@ added automatically if omitted.
 
 [header]
   __ _  ___  _ __  | _ __ _ __ _____  ___   _
- / _` + "`" + ` |/ _ \| '_ \ | '_ \| '__/ _ \ \/ / | | |
+ / _` |/ _ \| '_ \ | '_ \| '__/ _ \ \/ / | | |
 | (_| | (_) | |_) || |_) | | | (_) >  <| |_| |
  \__, |\___/| .__/ | .__/|_|  \___/_/\_\\__, |
   |___/     |_|    |_|                  |___/
 Welcome to the Gopher HTTP proxy.
 
 [urls]
+Bitsavers.org
+_______________________________
 Bitsavers PDF archive    | https://bitsavers.org/pdf/
+Bitsavers bits archive   | https://bitsavers.org/bits/
+
+GNU
+_______________________________
 GNU FTP archive          | https://ftp.gnu.org/gnu/
 ```
 
@@ -165,7 +183,8 @@ GNU FTP archive          | https://ftp.gnu.org/gnu/
 |-----------|----------------|
 | No config file | Single-URL mode using `-url` flag |
 | Config file with 1 URL | Single-URL mode, URL taken from config |
-| Config file with 2+ URLs | Top-level menu with header, separator, and a `type-1` selector per URL |
+| Config file with 2+ URLs, no groups | Top-level menu with header, separator, and a `type-1` selector per URL |
+| Config file with grouped URLs | Top-level menu with header, then each group rendered as a titled sub-section |
 
 ### Root gophermap layout (multi-URL mode)
 
@@ -175,14 +194,22 @@ i <header line 2>
 i ...
 i _______________________________
 i
-1 Label A     /proxy?url=<encoded>   host   port
-1 Label B     /proxy?url=<encoded>   host   port
+i <Group A title>
+i _______________________________
+1 Label A1    /proxy?url=<encoded>   host   port
+1 Label A2    /proxy?url=<encoded>   host   port
+i
+i <Group B title>
+i _______________________________
+1 Label B1    /proxy?url=<encoded>   host   port
 .
 ```
 
-The header section is separated from the URL selectors by the fixed string
-`_______________________________`. Each URL is rendered as a `type-1` Gopher
-directory item pointing to its proxied listing.
+The header section is separated from the URL groups by the fixed string
+`_______________________________`. Each group then begins with its title and
+another separator, followed by its `type-1` directory selectors. Groups are
+separated by a blank `type-i` line. Anonymous groups (URLs listed before any
+titled group) are rendered without a title or separator of their own.
 
 ---
 
@@ -274,8 +301,11 @@ Informational header lines use type `i` with placeholder host/port values.
 
 ### `buildRootGopherMap`
 Renders the top-level gophermap from the config file. Header lines from the
-`[header]` section become `type-i` info items; after the separator, each URL
-from `[urls]` becomes a `type-1` directory selector pointing to `/proxy?url=`.
+`[header]` section become `type-i` info items; after the main separator, each
+`URLGroup` is rendered as a titled sub-section (group title + separator as
+`type-i` info lines, followed by `type-1` directory selectors for each URL).
+Groups without a title skip the heading and separator. A blank `type-i` line
+is inserted between groups.
 
 ### `handleGopherConn`
 Reads the selector from the TCP connection, logs the connection and request,
@@ -283,9 +313,19 @@ routes it to `serveDirectory` or `serveFile`, and closes the connection when
 done. Each connection is handled in its own goroutine.
 
 ### `loadConfigFile`
-Parses `gopher-proxy.conf`, extracting `[header]` lines and `[urls]` entries.
-Returns `os.ErrNotExist` if the file is absent so the caller can fall back
-gracefully to single-URL mode.
+Parses `gopher-proxy.conf`, extracting `[header]` lines and the raw URL lines
+from `[urls]`. The URL lines are passed to `parseURLGroups` to produce the
+final `[]URLGroup` structure. Returns `os.ErrNotExist` if the file is absent
+so the caller can fall back gracefully to single-URL mode.
+
+### `parseURLGroups`
+Converts the raw lines from the `[urls]` section into `URLGroup` values using
+a single-pass look-ahead: if the next non-blank line after the current line is
+the separator string `_______________________________`, the current line is
+treated as a group title and a new group is opened. Otherwise the line is
+parsed as a `Label | URL` entry and appended to the current group. This means
+the old flat (ungrouped) format is fully backwards-compatible — all URLs land
+in a single anonymous group.
 
 ### HTML tokenizer
 A minimal hand-written tokenizer (`tokenizer` / `token`) processes the raw

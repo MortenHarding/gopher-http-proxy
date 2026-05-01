@@ -43,6 +43,12 @@ type ProxyURL struct {
 	URL   string // HTTP URL to proxy
 }
 
+// URLGroup is a named group of ProxyURLs shown under a titled section in the root gophermap.
+type URLGroup struct {
+	Title string
+	URLs  []ProxyURL
+}
+
 // DirEntry is a parsed row from an Apache directory listing.
 type DirEntry struct {
 	Name  string
@@ -123,9 +129,35 @@ const configFile = "gopher-proxy.conf"
 
 type proxyConfig struct {
 	HeaderLines []string
-	URLs        []ProxyURL
+	Groups      []URLGroup
 }
 
+// allURLs returns a flat slice of all ProxyURLs across all groups.
+// Used for single-URL fallback and logging.
+func (pc *proxyConfig) allURLs() []ProxyURL {
+	var out []ProxyURL
+	for _, g := range pc.Groups {
+		out = append(out, g.URLs...)
+	}
+	return out
+}
+
+// loadConfigFile parses gopher-proxy.conf.
+//
+// The [urls] section supports optional groups. A group starts with a title
+// line, followed immediately by the separator string, then one or more URL
+// lines. URLs that appear before any group title are collected into an
+// anonymous group (empty Title). Example:
+//
+//	[urls]
+//	Bitsavers.org
+//	_______________________________
+//	Software archive   | https://bitsavers.org/bits/
+//	Computing archive  | https://bitsavers.org/pdf/
+//
+//	GNU
+//	_______________________________
+//	GNU FTP archive    | https://ftp.gnu.org/gnu/
 func loadConfigFile(filename string) (*proxyConfig, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -135,12 +167,22 @@ func loadConfigFile(filename string) (*proxyConfig, error) {
 
 	cfg := &proxyConfig{}
 	section := ""
+
+	// For the [urls] section we do a two-pass approach: collect raw lines
+	// first, then parse groups from them so we can handle the look-ahead
+	// needed for "title / separator / urls" detection.
+	var urlLines []string
+
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			if section == "urls" {
+				// Preserve blank lines as group delimiters inside [urls]
+				urlLines = append(urlLines, "")
+			}
 			continue
 		}
 		if trimmed == "[header]" {
@@ -156,25 +198,88 @@ func loadConfigFile(filename string) (*proxyConfig, error) {
 		case "header":
 			cfg.HeaderLines = append(cfg.HeaderLines, line)
 		case "urls":
-			label := trimmed
-			rawURL := trimmed
-			if idx := strings.Index(trimmed, "|"); idx >= 0 {
-				label = strings.TrimSpace(trimmed[:idx])
-				rawURL = strings.TrimSpace(trimmed[idx+1:])
-			}
-			cfg.URLs = append(cfg.URLs, ProxyURL{
-				Label: label,
-				URL:   ensureScheme(rawURL),
-			})
+			urlLines = append(urlLines, trimmed)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("reading %s: %w", filename, err)
 	}
-	if len(cfg.URLs) == 0 {
+
+	// Parse urlLines into groups.
+	// A group is introduced by:  <title line>  followed by  <sectionSep line>
+	// If a URL appears without a preceding group header it goes into the
+	// current group (initially an anonymous one).
+	cfg.Groups = parseURLGroups(urlLines)
+
+	if len(cfg.allURLs()) == 0 {
 		return nil, fmt.Errorf("%s: no [urls] entries found", filename)
 	}
 	return cfg, nil
+}
+
+// parseURLGroups converts the raw lines from the [urls] section into URLGroups.
+func parseURLGroups(lines []string) []URLGroup {
+	var groups []URLGroup
+	current := URLGroup{} // anonymous group for URLs before any titled group
+
+	parseURL := func(trimmed string) ProxyURL {
+		label := trimmed
+		rawURL := trimmed
+		if idx := strings.Index(trimmed, "|"); idx >= 0 {
+			label = strings.TrimSpace(trimmed[:idx])
+			rawURL = strings.TrimSpace(trimmed[idx+1:])
+		}
+		return ProxyURL{Label: label, URL: ensureScheme(rawURL)}
+	}
+
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+
+		// Skip blank sentinel lines
+		if line == "" {
+			i++
+			continue
+		}
+
+		// Peek ahead: if the *next* non-blank line is the separator, this
+		// line is a group title.
+		nextNonBlank := ""
+		for j := i + 1; j < len(lines); j++ {
+			if lines[j] != "" {
+				nextNonBlank = lines[j]
+				break
+			}
+		}
+
+		if nextNonBlank == sectionSep {
+			// Save current group (if it has URLs) and start a new titled group.
+			if len(current.URLs) > 0 {
+				groups = append(groups, current)
+			}
+			current = URLGroup{Title: line}
+			// Advance past title and separator
+			i++
+			for i < len(lines) && lines[i] == "" {
+				i++
+			}
+			if i < len(lines) && lines[i] == sectionSep {
+				i++ // consume the separator
+			}
+			continue
+		}
+
+		// Not a group title — treat as a URL line.
+		current.URLs = append(current.URLs, parseURL(line))
+		i++
+	}
+
+	// Flush the last group.
+	if len(current.URLs) > 0 {
+		groups = append(groups, current)
+	}
+
+	return groups
 }
 
 // writeExampleConfig writes a sample gopher-proxy.conf for the user.
@@ -189,6 +294,17 @@ func writeExampleConfig() {
 #   [urls]     One URL per line.  Format:
 #                 Display Label | https://host/path/
 #              A bare URL with no '|' uses the URL itself as the label.
+#
+#              URLs can be organised into named groups.  A group starts
+#              with a title line followed immediately by the separator:
+#
+#                 My Group Title
+#                 _______________________________
+#                 Label A  | https://example.org/a/
+#                 Label B  | https://example.org/b/
+#
+#              Groups are separated by a blank line.
+#              URLs listed before any group title form an anonymous group.
 
 [header]
   __ _  ___  _ __  | _ __ _ __ _____  ___   _
@@ -198,7 +314,13 @@ func writeExampleConfig() {
  |___/      |_|    |_|                  |___/
 
 [urls]
+Bitsavers.org
+_______________________________
 Bitsavers PDF archive    | https://bitsavers.org/pdf/
+Bitsavers bits archive   | https://bitsavers.org/bits/
+
+GNU
+_______________________________
 GNU FTP archive          | https://ftp.gnu.org/gnu/
 `
 	if err := os.WriteFile(configFile+".example", []byte(example), 0644); err != nil {
@@ -435,11 +557,18 @@ func buildGopherMap(cfg *Config, title string, entries []DirEntry, httpURL strin
 }
 
 // buildRootGopherMap builds the top-level gophermap from the config file.
-// Layout:
+//
+// Layout (multi-URL mode):
 //
 //	[header lines as type-i info]
 //	_______________________________
-//	[type-1 directory selectors for each URL]
+//	                                 ← blank info line
+//	[for each group:]
+//	  i <Title>                      ← only when group has a title
+//	  i _______________________________
+//	  1 Label   /proxy?url=...
+//	  ...
+//	  i                              ← blank spacer between groups
 func buildRootGopherMap(cfg *Config, pcfg *proxyConfig) string {
 	var sb strings.Builder
 	none := "none"
@@ -452,14 +581,27 @@ func buildRootGopherMap(cfg *Config, pcfg *proxyConfig) string {
 		write("i%s\t\t%s\t%d\r\n", line, none, zero)
 	}
 
-	// Separator
+	// Separator between header and URL groups
 	write("i%s\t\t%s\t%d\r\n", sectionSep, none, zero)
 	write("i\t\t%s\t%d\r\n", none, zero)
 
-	// URL selectors
-	for _, pu := range pcfg.URLs {
-		selector := "/proxy?url=" + url.QueryEscape(pu.URL)
-		write("%c%s\t%s\t%s\t%d\r\n", TypeDirectory, pu.Label, selector, cfg.Host, cfg.Port)
+	// URL groups
+	for gi, group := range pcfg.Groups {
+		// Group title + separator (only when the group has a non-empty title)
+		if group.Title != "" {
+			write("i%s\t\t%s\t%d\r\n", group.Title, none, zero)
+			write("i%s\t\t%s\t%d\r\n", sectionSep, none, zero)
+		}
+
+		for _, pu := range group.URLs {
+			selector := "/proxy?url=" + url.QueryEscape(pu.URL)
+			write("%c%s\t%s\t%s\t%d\r\n", TypeDirectory, pu.Label, selector, cfg.Host, cfg.Port)
+		}
+
+		// Blank spacer between groups (but not after the last one)
+		if gi < len(pcfg.Groups)-1 {
+			write("i\t\t%s\t%d\r\n", none, zero)
+		}
 	}
 
 	write(".\r\n")
@@ -484,7 +626,7 @@ func handleGopherConn(conn net.Conn, cfg *Config, pcfg *proxyConfig, cl *connLog
 
 	switch {
 	case selector == "" || selector == "/":
-		if pcfg != nil && len(pcfg.URLs) > 1 {
+		if pcfg != nil && len(pcfg.allURLs()) > 1 {
 			// Multi-URL mode: serve the generated root gophermap
 			gmap := buildRootGopherMap(cfg, pcfg)
 			if _, werr := io.WriteString(conn, gmap); werr != nil {
@@ -593,9 +735,10 @@ func main() {
 		}
 		pcfg = nil
 	} else {
-		cl.logf("INFO loaded %s: %d URL(s) configured", configFile, len(pcfg.URLs))
-		if len(pcfg.URLs) == 1 {
-			*baseURL = pcfg.URLs[0].URL
+		allURLs := pcfg.allURLs()
+		cl.logf("INFO loaded %s: %d URL(s) in %d group(s)", configFile, len(allURLs), len(pcfg.Groups))
+		if len(allURLs) == 1 {
+			*baseURL = allURLs[0].URL
 		}
 	}
 
@@ -614,8 +757,8 @@ func main() {
 	cl.logf("INFO Gopher HTTP proxy ready")
 	cl.logf("INFO Listen : %s", addr)
 	cl.logf("INFO Host   : %s", *host)
-	if pcfg != nil && len(pcfg.URLs) > 1 {
-		for i, pu := range pcfg.URLs {
+	if pcfg != nil && len(pcfg.allURLs()) > 1 {
+		for i, pu := range pcfg.allURLs() {
 			cl.logf("INFO Source[%d]: %s -> %s", i+1, pu.Label, pu.URL)
 		}
 	} else {
