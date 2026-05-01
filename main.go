@@ -542,12 +542,12 @@ func buildGopherMap(cfg *Config, title string, entries []DirEntry, httpURL strin
 	for _, e := range entries {
 		if e.IsDir {
 			displayName := strings.TrimSuffix(e.Name, "/")
-			selector := "/proxy?url=" + url.QueryEscape(e.URL)
+			selector := "/proxy/" + e.URL
 			write("%c%s\t%s\t%s\t%d\r\n", TypeDirectory, displayName, selector, cfg.Host, cfg.Port)
 		} else {
 			displayName := path.Base(e.Name)
 			t := gopherType(e.Name)
-			selector := "/download?url=" + url.QueryEscape(e.URL)
+			selector := "/download/" + e.URL
 			write("%c%s\t%s\t%s\t%d\r\n", t, displayName, selector, cfg.Host, cfg.Port)
 		}
 	}
@@ -594,7 +594,7 @@ func buildRootGopherMap(cfg *Config, pcfg *proxyConfig) string {
 		}
 
 		for _, pu := range group.URLs {
-			selector := "/proxy?url=" + url.QueryEscape(pu.URL)
+			selector := "/proxy/" + pu.URL
 			write("%c%s\t%s\t%s\t%d\r\n", TypeDirectory, pu.Label, selector, cfg.Host, cfg.Port)
 		}
 
@@ -622,7 +622,11 @@ func handleGopherConn(conn net.Conn, cfg *Config, pcfg *proxyConfig, cl *connLog
 		return
 	}
 	selector := strings.TrimRight(string(buf[:n]), "\r\n")
-	cl.logf("REQUEST %s selector=%q", remoteAddr, selector)
+	logSelector := selector
+	if decoded, decErr := url.QueryUnescape(selector); decErr == nil {
+		logSelector = decoded
+	}
+	cl.logf("REQUEST %s selector=%q", remoteAddr, logSelector)
 
 	switch {
 	case selector == "" || selector == "/":
@@ -636,24 +640,12 @@ func handleGopherConn(conn net.Conn, cfg *Config, pcfg *proxyConfig, cl *connLog
 			serveDirectory(conn, cfg, cfg.BaseURL, remoteAddr, cl)
 		}
 
-	case strings.HasPrefix(selector, "/proxy?url="):
-		encoded := strings.TrimPrefix(selector, "/proxy?url=")
-		targetURL, decErr := url.QueryUnescape(encoded)
-		if decErr != nil {
-			writeError(conn, "Bad URL encoding")
-			cl.logf("ERROR %s bad URL encoding", remoteAddr)
-			return
-		}
+	case strings.HasPrefix(selector, "/proxy/"):
+		targetURL := strings.TrimPrefix(selector, "/proxy/")
 		serveDirectory(conn, cfg, targetURL, remoteAddr, cl)
 
-	case strings.HasPrefix(selector, "/download?url="):
-		encoded := strings.TrimPrefix(selector, "/download?url=")
-		targetURL, decErr := url.QueryUnescape(encoded)
-		if decErr != nil {
-			writeError(conn, "Bad URL encoding")
-			cl.logf("ERROR %s bad URL encoding", remoteAddr)
-			return
-		}
+	case strings.HasPrefix(selector, "/download/"):
+		targetURL := strings.TrimPrefix(selector, "/download/")
 		serveFile(conn, targetURL, remoteAddr, cl)
 
 	default:
